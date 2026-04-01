@@ -1,4 +1,4 @@
-name: CI
+name: CI - SAST Security Pipeline
 
 on:
   push:
@@ -7,31 +7,288 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+
+  # ══════════════════════════════════════════════════════════════════
+  # TOOL 1 ❯ GITLEAKS
+  # Detects secrets leaked in source files & full git history:
+  #   → .env              : AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN
+  #   → backend/config.py : AZURE_SECRET, DB_PASSWORD hardcoded values
+  # ══════════════════════════════════════════════════════════════════
+  gitleaks:
+    name: "Gitleaks — Secrets Detection"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout code (full git history)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Run Gitleaks scan
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      continue-on-error: true
+
+    - name: Generate Gitleaks JSON report
+      run: |
+        curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | tar -xz
+        ./gitleaks detect \
+          --source . \
+          --report-format json \
+          --report-path gitleaks-report.json \
+          --redact \
+          --no-git=false \
+          --exit-code 0
+      continue-on-error: true
+
+    - name: Upload Gitleaks report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: gitleaks-secrets-report
+        path: gitleaks-report.json
+        retention-days: 14
+
+  # ══════════════════════════════════════════════════════════════════
+  # TOOL 2 ❯ SEMGREP
+  # Static code analysis across all source files:
+  #   → backend/app.py    : os.system() command injection, pickle.loads() insecure deserialization
+  #   → backend/config.py : hardcoded secrets (AZURE_SECRET, DB_PASSWORD)
+  #   → backend/db.py     : plaintext credentials in DB connection string
+  #   → frontend/app.js   : unvalidated user input sent to backend API
+  #   → terraform/main.tf : public blob storage, open NSG rules (IaC misconfig)
+  # ══════════════════════════════════════════════════════════════════
+  semgrep:
+    name: "Semgrep — SAST Analysis"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Node 18
-      uses: actions/setup-node@v4
+    - name: Install Semgrep
+      run: pip install semgrep
+
+    - name: Run Semgrep — Python (backend)
+      run: |
+        semgrep \
+          --config p/python \
+          --config p/owasp-top-ten \
+          --config p/flask \
+          --config p/secrets \
+          --config p/command-injection \
+          --json \
+          --output semgrep-python.json \
+          backend/
+      continue-on-error: true
+
+    - name: Run Semgrep — JavaScript (frontend)
+      run: |
+        semgrep \
+          --config p/javascript \
+          --config p/owasp-top-ten \
+          --config p/xss \
+          --json \
+          --output semgrep-js.json \
+          frontend/
+      continue-on-error: true
+
+    - name: Run Semgrep — Terraform IaC (terraform)
+      run: |
+        semgrep \
+          --config p/terraform \
+          --config p/terraform-security \
+          --json \
+          --output semgrep-terraform.json \
+          terraform/
+      continue-on-error: true
+
+    - name: Run Semgrep — SARIF (for GitHub Security tab)
+      run: |
+        semgrep \
+          --config p/python \
+          --config p/javascript \
+          --config p/terraform \
+          --config p/owasp-top-ten \
+          --config p/secrets \
+          --sarif \
+          --output semgrep.sarif \
+          backend/ frontend/ terraform/
+      continue-on-error: true
+
+    - name: Upload Semgrep SARIF to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
       with:
-        node-version: 18
+        sarif_file: semgrep.sarif
+        category: semgrep
+      if: always()
 
-    - name: Install dependencies
-      run: npm ci
-
-    - name: Run build
-      run: npm run build
-
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
+    - name: Upload Semgrep Python report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
       with:
-        languages: javascript
+        name: semgrep-python-report
+        path: semgrep-python.json
+        retention-days: 14
 
-    - name: Autobuild
-      uses: github/codeql-action/autobuild@v3
+    - name: Upload Semgrep JavaScript report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: semgrep-javascript-report
+        path: semgrep-js.json
+        retention-days: 14
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+    - name: Upload Semgrep Terraform report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: semgrep-terraform-report
+        path: semgrep-terraform.json
+        retention-days: 14
+
+    - name: Upload Semgrep SARIF artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: semgrep-sarif-report
+        path: semgrep.sarif
+        retention-days: 14
+
+  # ══════════════════════════════════════════════════════════════════
+  # TOOL 3 ❯ TRIVY
+  # Container, filesystem & IaC vulnerability scanning:
+  #   → Dockerfile        : python:3.9 base image CVEs, running as root (no USER directive)
+  #   → backend/requirements.txt : known CVEs in fastapi / uvicorn versions
+  #   → terraform/main.tf : public blob storage, open NSG inbound rules
+  # ══════════════════════════════════════════════════════════════════
+  trivy:
+    name: "Trivy — Container & IaC Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build Docker image from Dockerfile
+      run: docker build -t sast-demo:${{ github.sha }} .
+
+    - name: Trivy — Container image scan (Dockerfile + python:3.9 CVEs)
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: sast-demo:${{ github.sha }}
+        format: sarif
+        output: trivy-container.sarif
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+
+    - name: Trivy — Container image JSON report
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: sast-demo:${{ github.sha }}
+        format: json
+        output: trivy-container.json
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+
+    - name: Trivy — Filesystem scan (backend/requirements.txt deps)
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: fs
+        scan-ref: backend/
+        format: sarif
+        output: trivy-fs.sarif
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+
+    - name: Trivy — Filesystem JSON report
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: fs
+        scan-ref: backend/
+        format: json
+        output: trivy-fs.json
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+
+    - name: Trivy — IaC scan (terraform/main.tf misconfigurations)
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: config
+        scan-ref: terraform/
+        format: sarif
+        output: trivy-iac.sarif
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+
+    - name: Trivy — IaC JSON report
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: config
+        scan-ref: terraform/
+        format: json
+        output: trivy-iac.json
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+
+    - name: Upload Trivy Container SARIF to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-container.sarif
+        category: trivy-container
+      if: always()
+
+    - name: Upload Trivy Filesystem SARIF to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-fs.sarif
+        category: trivy-filesystem
+      if: always()
+
+    - name: Upload Trivy IaC SARIF to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-iac.sarif
+        category: trivy-iac
+      if: always()
+
+    - name: Upload Trivy Container report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-container-report
+        path: |
+          trivy-container.json
+          trivy-container.sarif
+        retention-days: 14
+
+    - name: Upload Trivy Filesystem report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-filesystem-report
+        path: |
+          trivy-fs.json
+          trivy-fs.sarif
+        retention-days: 14
+
+    - name: Upload Trivy IaC report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-iac-report
+        path: |
+          trivy-iac.json
+          trivy-iac.sarif
+        retention-days: 14
